@@ -1,0 +1,260 @@
+import serial
+import time
+import json
+import logging
+import requests
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import datetime
+from azure.iot.device import IoTHubDeviceClient, Message
+from azure.iot.device.provisioning import ProvisioningDeviceClient
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+ID_SCOPE = "0ne0110D45F"
+DEVICE_ID = "n1vmhqulmb"
+PRIMARY_KEY = "sIwknHtHZ1R45MniK6m/UCZhrXPSGMbmxOyUBss/EHw="
+SERIAL_PORT = "COM3"
+BAUD_RATE = 9600
+
+ENDPOINT_URL = "https://mlg55-nqodp.eastus2.inference.ml.azure.com/score"
+API_KEY = "6w6yJAXQOFy7Vja1Nq9hFo1LoRCO9UyUeZIW44wxQAu2quuN5mhnJQQJ99CDAAAAAAAAAAAAINFRAZMLIskS"
+
+# ============================================================
+# AQI CLASSIFICATION
+# ============================================================
+def classify_aqi(value):
+    if value <= 50:
+        return "Good"
+    elif value <= 100:
+        return "Moderate"
+    elif value <= 150:
+        return "Unhealthy for Sensitive Groups"
+    else:
+        return "Unhealthy"
+
+# ============================================================
+# READ ARDUINO SERIAL DATA
+# ============================================================
+def read_serial_data(ser):
+    try:
+        if ser.in_waiting > 0:
+            line = ser.readline().decode('utf-8', errors='ignore').strip()
+            print(f"Received: {line}")
+            if "AQI Reading:" in line:
+                parts = line.split(":")
+                if len(parts) >= 2:
+                    return int(parts[1].strip())
+        return None
+    except Exception as e:
+        print(f"Serial error: {e}")
+        return None
+
+# ============================================================
+# CONNECT TO IOT CENTRAL
+# ============================================================
+def connect_to_iot_central():
+    print("Registering with IoT Central...")
+    provisioning_client = ProvisioningDeviceClient.create_from_symmetric_key(
+        provisioning_host="global.azure-devices-provisioning.net",
+        registration_id=DEVICE_ID,
+        id_scope=ID_SCOPE,
+        symmetric_key=PRIMARY_KEY
+    )
+    result = provisioning_client.register()
+    conn_str = f"HostName={result.registration_state.assigned_hub};DeviceId={DEVICE_ID};SharedAccessKey={PRIMARY_KEY}"
+    client = IoTHubDeviceClient.create_from_connection_string(conn_str)
+    client.connect()
+    print("Connected to IoT Central!")
+    return client
+
+# ============================================================
+# GET PREDICTION FROM AZURE ML ENDPOINT
+# ============================================================
+def get_prediction(sensor_value):
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {API_KEY}"
+    }
+    payload = {
+        "input_data": {
+            "columns": [
+                "created_at", "entry_id", "field1", "field3",
+                "field4", "field5", "field6", "field7"
+            ],
+            "index": [0, 1, 2, 3],
+            "data": [
+                ["2024-04-06 12:00:27", 1256, 163, 33.8, 49.0, 520.0, 18.0, 21.0],
+                ["2024-04-06 12:15:27", 1256, 163, 32.0, 49.0, 520.0, 18.0, 21.0],
+                ["2024-04-06 12:30:27", 1256, 163, 32.0, 49.0, 520.0, 18.0, 21.0],
+                ["2024-04-06 12:45:27", 1256, 163, 32.0, 49.0, 520.0, 18.0, 21.0]
+            ]
+        }
+    }
+    try:
+        response = requests.post(ENDPOINT_URL, headers=headers,
+                                json=payload, timeout=10)
+        if response.status_code == 200:
+            result = response.json()
+            if isinstance(result, list):
+                return round(float(result[0]), 2)
+        print(f"Endpoint error: {response.status_code}")
+        return None
+    except Exception as e:
+        print(f"ML error: {e}")
+        return None
+
+# ============================================================
+# ANOMALY DETECTION USING MAD
+# ============================================================
+def detect_anomaly(actual, predicted, history_actual, history_predicted):
+    if len(history_actual) < 2:
+        return False, 0, 0
+
+    residuals = [a - p for a, p in zip(history_actual, history_predicted)]
+    median_res = np.median(residuals)
+    mad = np.median(np.abs(np.array(residuals) - median_res))
+    threshold = 10 if mad == 0 else 3 * mad
+
+    current_residual = abs(actual - predicted)
+    is_anomaly = current_residual > threshold
+
+    max_diff = 50
+    anomaly_score = round(min(current_residual / max_diff, 1.0), 2)
+
+    return is_anomaly, current_residual, anomaly_score
+
+# ============================================================
+# PLOT RESULTS
+# ============================================================
+def plot_results(timestamps, actual_values, predicted_values, anomalies):
+    plt.figure(figsize=(12, 5))
+    plt.plot(timestamps, actual_values, marker='o',
+             label='Actual Values', color='blue', linewidth=2)
+    plt.plot(timestamps, predicted_values, marker='s', linestyle='--',
+             label='Predicted Values (ARIMA)', color='orange', linewidth=2)
+
+    for i, idx in enumerate(anomalies):
+        label = 'Anomaly Detected' if i == 0 else ''
+        plt.axvline(x=timestamps[idx], color='red',
+                   linestyle=':', alpha=0.8, label=label)
+
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+    plt.xticks(rotation=45)
+    plt.title('G5 - Actual vs Predicted AQI Sensor Values (Real-Time)')
+    plt.xlabel('Time')
+    plt.ylabel('MQ-135 Sensor Value')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig('g5_realtime_results.png', dpi=150)
+    plt.show()
+    print("Graph saved!")
+
+# ============================================================
+# MAIN
+# ============================================================
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.WARNING)
+
+    print("=" * 60)
+    print("  G5 - Real-Time AQI Monitoring + Anomaly Detection")
+    print("=" * 60)
+
+    iot_client = connect_to_iot_central()
+
+    print(f"Opening serial port {SERIAL_PORT}...")
+    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+    time.sleep(2)
+    ser.reset_input_buffer()
+    print("Arduino connected!")
+
+    actual_history = []
+    predicted_history = []
+    timestamps = []
+    anomaly_indices = []
+    total_readings = 0
+    total_anomalies = 0
+
+    try:
+        while True:
+            sensor_value = read_serial_data(ser)
+
+            if sensor_value is not None:
+                total_readings += 1
+                now = datetime.datetime.now()
+                status = classify_aqi(sensor_value)
+
+                predicted_value = get_prediction(sensor_value)
+
+                if predicted_value is None:
+                    predicted_value = sensor_value
+                    print("ML endpoint unavailable - using actual as fallback")
+
+                actual_history.append(sensor_value)
+                predicted_history.append(predicted_value)
+                timestamps.append(now)
+
+                is_anomaly, deviation, score = detect_anomaly(
+                    sensor_value, predicted_value,
+                    actual_history, predicted_history
+                )
+
+                if is_anomaly:
+                    total_anomalies += 1
+                    anomaly_indices.append(len(actual_history) - 1)
+
+                payload = {
+                "airQualityValue": sensor_value,
+                "airQualityStatus": status,
+                "predictedValue": predicted_value,
+                "anomalyDetected": int(is_anomaly),
+                "anomalyScore": score
+            }
+                message = Message(json.dumps(payload))
+                message.content_type = "application/json"
+                message.content_encoding = "utf-8"
+                iot_client.send_message(message)
+
+                anomaly_flag = "*** ANOMALY DETECTED! ***" if is_anomaly else "Normal"
+                print(f"[{now.strftime('%H:%M:%S')}] "
+                      f"Actual: {sensor_value:4d} | "
+                      f"Predicted: {predicted_value:6.2f} | "
+                      f"Diff: {deviation:5.2f} | "
+                      f"Score: {score} | "
+                      f"{anomaly_flag}")
+
+                if is_anomaly:
+                    print(f"    *** AQI spike! Deviation of {deviation:.2f} ***")
+
+                if total_readings % 10 == 0:
+                    rate = (total_anomalies / total_readings) * 100
+                    print(f"\n--- SUMMARY: {total_readings} readings | "
+                          f"{total_anomalies} anomalies ({rate:.1f}%) ---\n")
+
+            else:
+                print("Waiting for sensor data...")
+
+            time.sleep(5)
+
+    except KeyboardInterrupt:
+        print("\n" + "=" * 60)
+        print("FINAL SUMMARY")
+        print(f"Total readings  : {total_readings}")
+        print(f"Anomalies found : {total_anomalies}")
+        if total_readings > 0:
+            print(f"Anomaly rate    : "
+                  f"{(total_anomalies/total_readings)*100:.1f}%")
+        print("=" * 60)
+
+        if len(actual_history) > 1:
+            plot_results(timestamps, actual_history,
+                        predicted_history, anomaly_indices)
+
+    finally:
+        if ser and ser.is_open:
+            ser.close()
+        iot_client.shutdown()
+        print("System shutdown complete.")
