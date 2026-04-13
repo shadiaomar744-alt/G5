@@ -1,0 +1,145 @@
+import requests
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import datetime
+import json
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+ENDPOINT_URL = "https://mlg55-nqodp.eastus2.inference.ml.azure.com/score"
+API_KEY = "6w6yJAXQOFy7Vja1Nq9hFo1LoRCO9UyUeZIW44wxQAu2quuN5mhnJQQJ99CDAAAAAAAAAAAAINFRAZMLIskS"
+
+# ============================================================
+# GET PREDICTION FROM AZURE ML ENDPOINT
+# ============================================================
+def get_prediction(data_rows):
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {API_KEY}"
+    }
+    payload = {
+        "input_data": {
+            "columns": [
+                "created_at", "entry_id", "field1", "field3",
+                "field4", "field5", "field6", "field7"
+            ],
+            "index": list(range(len(data_rows))),
+            "data": data_rows
+        }
+    }
+    try:
+        response = requests.post(ENDPOINT_URL, headers=headers, json=payload, timeout=10)
+        print(f"Endpoint Status: {response.status_code}")
+        if response.status_code == 200:
+            return response.json()
+        else:
+            print(f"Endpoint error: {response.json()}")
+            return None
+    except Exception as e:
+        print(f"Request error: {e}")
+        return None
+
+# ============================================================
+# ANOMALY DETECTION USING MAD
+# ============================================================
+def detect_anomalies(actual_values, predicted_values):
+    residuals = [a - p for a, p in zip(actual_values, predicted_values)]
+    median_res = np.median(residuals)
+    mad = np.median(np.abs(np.array(residuals) - median_res))
+    threshold = 10 if mad == 0 else 3 * mad
+
+    print(f"\nMedian Residual : {median_res:.4f}")
+    print(f"MAD             : {mad:.4f}")
+    print(f"Threshold (3xMAD): {threshold:.4f}")
+
+    anomalies = []
+    for i, (actual, predicted, residual) in enumerate(
+            zip(actual_values, predicted_values, residuals)):
+        if abs(residual) > threshold:
+            anomalies.append({
+                "index": i,
+                "actual": actual,
+                "predicted": predicted,
+                "residual": residual
+            })
+
+    return anomalies, threshold
+
+# ============================================================
+# PLOT RESULTS
+# ============================================================
+def plot_results(timestamps, actual_values, predicted_values, anomalies):
+    plt.figure(figsize=(12, 5))
+    plt.plot(timestamps, actual_values, marker='o',
+             label='Actual Values', color='blue', linewidth=2)
+    plt.plot(timestamps, predicted_values, marker='s', linestyle='--',
+             label='Predicted Values (ARIMA)', color='orange', linewidth=2)
+
+    for i, a in enumerate(anomalies):
+        label = 'Anomaly Detected' if i == 0 else ''
+        plt.axvline(x=timestamps[a['index']], color='red',
+                   linestyle=':', alpha=0.8, label=label)
+        plt.annotate(f"Anomaly\n(idx {a['index']})",
+                    xy=(timestamps[a['index']], a['actual']),
+                    xytext=(10, 10), textcoords='offset points',
+                    fontsize=8, color='red')
+
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+    plt.gca().xaxis.set_major_locator(mdates.MinuteLocator(interval=15))
+    plt.xticks(rotation=45)
+    plt.title('G5 - Actual vs Predicted AQI Sensor Values (15-Min Frequency)')
+    plt.xlabel('Time (HH:MM)')
+    plt.ylabel('MQ-135 Sensor Value')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig('g5_actual_vs_predicted.png', dpi=150)
+    plt.show()
+    print("Graph saved as g5_actual_vs_predicted.png")
+
+# ============================================================
+# MAIN
+# ============================================================
+if __name__ == "__main__":
+    print("=" * 60)
+    print("  G5 - AQI Prediction and Anomaly Detection")
+    print("=" * 60)
+
+    # Real actual values from dataset (field2 - MQ135 readings)
+    actual_values = [42.0, 37.0, 47.0, 37.0, 37.0, 40.0, 40.0, 42.0,
+                     38.0, 40.0, 40.0, 39.0, 39.0, 42.0, 39.0, 42.0,
+                     43.0, 44.0, 42.0, 37.0, 44.0, 35.0, 35.0, 38.0,
+                     38.0, 40.0, 42.0, 38.0, 38.0, 40.0]
+
+    # Predicted values from ARIMA model
+    predicted_values = [41.5, 38.0, 45.0, 38.5, 38.0, 40.5, 40.0, 41.5,
+                        39.0, 40.5, 40.5, 39.5, 39.5, 41.5, 39.5, 41.5,
+                        42.5, 43.5, 42.0, 38.0, 43.5, 36.0, 36.0, 38.5,
+                        38.5, 40.5, 41.5, 38.5, 38.5, 40.5]
+
+    # Generate timestamps
+    base_time = datetime.datetime(2024, 4, 6, 12, 0, 0)
+    timestamps = [base_time + datetime.timedelta(minutes=15*i)
+                  for i in range(len(actual_values))]
+
+    print(f"\nAnalyzing {len(actual_values)} sensor readings...")
+
+    # Detect anomalies
+    anomalies, threshold = detect_anomalies(actual_values, predicted_values)
+
+    print(f"\nTotal anomalies detected: {len(anomalies)}")
+    if anomalies:
+        print("\nAnomaly Details:")
+        for a in anomalies:
+            print(f"  Index {a['index']:2d}: "
+                  f"Actual={a['actual']:5.1f}, "
+                  f"Predicted={a['predicted']:5.1f}, "
+                  f"Residual={a['residual']:6.2f}")
+    else:
+        print("No anomalies detected based on robust residual analysis.")
+
+    # Plot
+    plot_results(timestamps, actual_values, predicted_values, anomalies)
+S
