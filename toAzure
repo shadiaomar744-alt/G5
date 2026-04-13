@@ -1,0 +1,140 @@
+import time
+import serial
+import serial.serialutil
+import logging
+from azure.iot.device import IoTHubDeviceClient, Message
+from azure.iot.device.exceptions import ConnectionDroppedError
+from azure.iot.device.provisioning import ProvisioningDeviceClient
+
+# ========== CONFIGURATION ==========
+ID_SCOPE = "0ne0110D45F"
+DEVICE_ID = "n1vmhqulmb"
+PRIMARY_KEY = "sIwknHtHZ1R45MniK6m/UCZhrXPSGMbmxOyUBss/EHw="
+SERIAL_PORT = 'COM3'
+BAUD_RATE = 9600
+HEARTBEAT_INTERVAL = 30
+# ===================================
+
+logging.getLogger("azure.iot.device").setLevel(logging.ERROR)
+logging.getLogger("azure.iot.device.common.transport_exceptions").setLevel(logging.CRITICAL)
+
+def connect_to_azure():
+    print("Registering device with IoT Central...")
+    provisioning_client = ProvisioningDeviceClient.create_from_symmetric_key(
+        provisioning_host="global.azure-devices-provisioning.net",
+        registration_id=DEVICE_ID,
+        id_scope=ID_SCOPE,
+        symmetric_key=PRIMARY_KEY
+    )
+    result = provisioning_client.register()
+    hub = result.registration_state.assigned_hub
+    connection_string = f"HostName={hub};DeviceId={DEVICE_ID};SharedAccessKey={PRIMARY_KEY}"
+    print(f"Registered! Hub: {hub}")
+    client = IoTHubDeviceClient.create_from_connection_string(connection_string)
+    client.connect()
+    print("Connected to Azure IoT Central!")
+    return client
+
+def ensure_azure_connection(client):
+    try:
+        client.send_message(Message("heartbeat"), timeout=1)
+        return True
+    except ConnectionDroppedError:
+        print("Azure connection lost. Reconnecting...")
+        try:
+            client.reconnect()
+            print("Reconnected.")
+            return True
+        except Exception as e:
+            print(f"Reconnect failed: {e}")
+            return False
+    except Exception:
+        return True
+
+def send_message_with_retry(client, message_text, max_retries=2):
+    for attempt in range(max_retries):
+        try:
+            msg = Message('{{"airQuality": {}}}'.format(message_text))
+            msg.content_type = "application/json"
+            msg.content_encoding = "utf-8"
+            client.send_message(msg)
+            print(f"Sent to IoT Central: airQuality = {message_text}")
+            return True
+        except ConnectionDroppedError:
+            if attempt < max_retries - 1:
+                print("Connection lost during send, reconnecting...")
+                try:
+                    client.reconnect()
+                    time.sleep(1)
+                except:
+                    pass
+            else:
+                print("Failed to send after retries.")
+                return False
+        except Exception as e:
+            print(f"Unexpected send error: {e}")
+            return False
+    return False
+
+def open_serial_port(port, baudrate, timeout=1):
+    while True:
+        try:
+            ser = serial.Serial(port, baudrate, timeout=timeout)
+            print(f"Connected to Arduino on {port}")
+            return ser
+        except serial.serialutil.SerialException as e:
+            if "Access is denied" in str(e):
+                print(f"Port {port} is already in use. Close Arduino IDE!")
+            else:
+                print(f"Serial error: {e}")
+            print(f"Retrying in 5 seconds...")
+            time.sleep(5)
+        except PermissionError as e:
+            print(f"Permission denied on {port}: {e}")
+            time.sleep(5)
+
+def main():
+    client = connect_to_azure()
+    last_heartbeat = time.time()
+    ser = open_serial_port(SERIAL_PORT, BAUD_RATE)
+
+    try:
+        while True:
+            now = time.time()
+            if now - last_heartbeat >= HEARTBEAT_INTERVAL:
+                if not ensure_azure_connection(client):
+                    print("Cannot maintain Azure connection. Will retry later.")
+                last_heartbeat = now
+
+            try:
+                if ser.in_waiting:
+                    line = ser.readline().decode('utf-8', errors='ignore').strip()
+                    if line.isdigit():
+                        send_message_with_retry(client, int(line))
+                else:
+                    time.sleep(0.05)
+            except (serial.serialutil.SerialException, OSError) as e:
+                print(f"Serial lost: {e}. Reopening...")
+                ser.close()
+                ser = open_serial_port(SERIAL_PORT, BAUD_RATE)
+            except UnicodeDecodeError:
+                pass
+            except Exception as e:
+                print(f"Unexpected error: {e}")
+                time.sleep(1)
+
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+    finally:
+        if ser and ser.is_open:
+            ser.close()
+            print("Serial port closed.")
+        try:
+            client.shutdown()
+            print("Azure IoT Hub client shut down.")
+        except:
+            pass
+        print("Clean shutdown complete.")
+
+if __name__ == "__main__":
+    main()
